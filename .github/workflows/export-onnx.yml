@@ -1,0 +1,71 @@
+name: Export ONNX model
+
+# Converts ampixa/nepali-conformer-offline to ONNX and publishes it as a release of this fork,
+# for runtimes that can't ship NeMo/PyTorch (e.g. the Just Talk desktop app).
+# The weights stay under CC BY-NC 4.0 with attribution to Ampixa (see export/MODEL_CARD.md).
+# Needs repository secret HF_TOKEN: a Hugging Face read token for an account with access to the gated model.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish"
+        required: true
+        default: "onnx-v1"
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install NeMo (CPU) and export tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y libsndfile1 ffmpeg
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install "nemo_toolkit[asr]" onnx onnxruntime huggingface_hub
+          python -c "import nemo; print('NeMo', nemo.__version__)"
+
+      - name: Download gated checkpoint
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          test -n "$HF_TOKEN" || { echo "::error::Set the HF_TOKEN repository secret first"; exit 1; }
+          hf download ampixa/nepali-conformer-offline nepali_conformer_offline.nemo --local-dir ckpt
+          ls -la ckpt
+
+      - name: Download public reference clips
+        run: |
+          mkdir -p clips
+          for f in fleurs_ne_np_test_1749 fleurs_ne_np_test_1900 neptel_s02_seg_0003 neptel_s02_seg_0017 neptel_s03_seg_0001 neptel_s03_seg_0014; do
+            curl -sfL -o "clips/$f.wav" "https://huggingface.co/spaces/voidash/nepaliconformer/resolve/main/examples/$f.wav"
+          done
+          ls -la clips
+
+      - name: Export to ONNX
+        run: python export/export_onnx.py --nemo ckpt/nepali_conformer_offline.nemo --out dist clips/*.wav
+
+      - name: Package release
+        run: |
+          cp export/MODEL_CARD.md dist/README.md
+          cp LICENSE dist/LICENSE-code.txt
+          curl -sfL -o dist/LICENSE-model-CC-BY-NC-4.0.txt https://creativecommons.org/licenses/by-nc/4.0/legalcode.txt
+          (cd dist && tar czf reference.tar.gz reference && rm -rf reference && sha256sum * > SHA256SUMS.txt)
+          ls -la dist
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ inputs.tag }}" dist/* \
+            --title "NepaliConformer offline — ONNX int8 (${{ inputs.tag }})" \
+            --notes-file export/MODEL_CARD.md
